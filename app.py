@@ -210,7 +210,6 @@ def _estimate_cost_usd(model: str, prompt_tokens: int, completion_tokens: int, c
     )
 
 def call_mode(client: OpenAI, model: str, mode_name: str, user_prompt: str) -> RunResult:
-    """Call the DeepSeek API for one mode and return a RunResult."""
     result = RunResult(mode=mode_name)
     mode_cfg = MODES[mode_name]
     start = time.perf_counter()
