@@ -18,7 +18,7 @@ from openai import OpenAI
 # CONFIGURATION
 # ═══════════════════════════════════════════════════════════════
 
-DEEPSEEK_BASE_URL = "https://api.deepseek.com/v1"
+DEEPSEEK_BASE_URL = "https://api.deepseek.com"
 DEEPSEEK_API_KEY_ENV = "DEEPSEEK_API_KEY"
 
 # ── Model names 
@@ -27,48 +27,48 @@ MODELS = {
     "DeepSeek-V4-Pro": "deepseek-v4-pro",
 }
 
-# ── Three reasoning modes 
+# ── Three reasoning modes — controlled via official V4 thinking parameters
 MODES: Dict[str, dict] = {
     "Non-think": {
         "icon": "⚡",
         "color": "#10b981",
         "badge": "green",
         "desc": "Fast, direct answers — no internal reasoning",
-        "system": (
-            "You are a direct, efficient assistant. "
-            "Answer concisely and immediately without chain-of-thought or extended reasoning. "
-            "Do not narrate your thinking process."
-        ),
+        "thinking_type": "disabled",
+        "reasoning_effort": None,
     },
     "Think High": {
         "icon": "🧠",
         "color": "#3b82f6",
         "badge": "blue",
         "desc": "Careful step-by-step reasoning before responding",
-        "system": (
-            "You are a careful, analytical assistant. "
-            "Think through the problem methodically before responding. "
-            "Show clear reasoning, check for errors, and structure your answer well."
-        ),
+        "thinking_type": "enabled",
+        "reasoning_effort": "high",
     },
     "Think Max": {
         "icon": "🔥",
         "color": "#ef4444",
         "badge": "red",
         "desc": "Exhaustive reasoning — push analysis to the limit",
-        "system": (
-            "You are solving a problem that demands your absolute best reasoning. "
-            "Explore every approach, verify rigorously, consider all edge cases, "
-            "identify and fix errors in your logic, and push your analysis to its fullest extent. "
-            "Only commit to a final answer when you are certain it is correct and complete."
-        ),
+        "thinking_type": "enabled",
+        "reasoning_effort": "max",
     },
 }
 
-# ── Approximate pricing per 1M tokens 
+# ── Pricing per 1M tokens
+# These values reflect the official DeepSeek pricing page as of 2026-04-29.
+# Cache-hit pricing changed on 2026-04-26, and V4 Pro is currently discounted.
 PRICING = {
-    "deepseek-v4-flash": {"input": 0.27, "output": 1.10},
-    "deepseek-v4-pro":   {"input": 0.55, "output": 2.19},
+    "deepseek-v4-flash": {
+        "input_cache_hit": 0.0028,
+        "input_cache_miss": 0.14,
+        "output": 0.28,
+    },
+    "deepseek-v4-pro": {
+        "input_cache_hit": 0.003625,
+        "input_cache_miss": 0.435,
+        "output": 0.87,
+    },
 }
 
 # ── Task templates 
@@ -183,6 +183,32 @@ class RunResult:
 # API LOGIC
 # ═══════════════════════════════════════════════════════════════
 
+def _get_cached_prompt_tokens(usage) -> int:
+    """Best-effort extraction of cached prompt tokens from the SDK response."""
+    prompt_details = getattr(usage, "prompt_tokens_details", None)
+    if prompt_details is None:
+        return 0
+
+    cached_tokens = getattr(prompt_details, "cached_tokens", None)
+    if cached_tokens is not None:
+        return cached_tokens or 0
+
+    if isinstance(prompt_details, dict):
+        return prompt_details.get("cached_tokens", 0) or 0
+
+    return 0
+
+
+def _estimate_cost_usd(model: str, prompt_tokens: int, completion_tokens: int, cached_prompt_tokens: int) -> float:
+    pricing = PRICING.get(model, PRICING["deepseek-v4-flash"])
+    cached_tokens = min(cached_prompt_tokens, prompt_tokens)
+    uncached_tokens = max(prompt_tokens - cached_tokens, 0)
+    return (
+        cached_tokens / 1_000_000 * pricing["input_cache_hit"]
+        + uncached_tokens / 1_000_000 * pricing["input_cache_miss"]
+        + completion_tokens / 1_000_000 * pricing["output"]
+    )
+
 def call_mode(client: OpenAI, model: str, mode_name: str, user_prompt: str) -> RunResult:
     """Call the DeepSeek API for one mode and return a RunResult."""
     result = RunResult(mode=mode_name)
@@ -190,35 +216,32 @@ def call_mode(client: OpenAI, model: str, mode_name: str, user_prompt: str) -> R
     start = time.perf_counter()
 
     try:
+        request_kwargs = {
+            "model": model,
+            "messages": [{"role": "user", "content": user_prompt}],
+            "max_tokens": 4096,
+            "extra_body": {"thinking": {"type": mode_cfg["thinking_type"]}},
+        }
+        if mode_cfg["reasoning_effort"]:
+            request_kwargs["reasoning_effort"] = mode_cfg["reasoning_effort"]
+
         response = client.chat.completions.create(
-            model=model,
-            messages=[
-                {"role": "system", "content": mode_cfg["system"]},
-                {"role": "user", "content": user_prompt},
-            ],
-            max_tokens=4096,
-            temperature=1.0,
-            top_p=1.0,
+            **request_kwargs,
         )
         result.latency = time.perf_counter() - start
 
-        raw = response.choices[0].message.content or ""
-        if "<think>" in raw and "</think>" in raw:
-            t0 = raw.index("<think>") + 7
-            t1 = raw.index("</think>")
-            result.thinking = raw[t0:t1].strip()
-            result.answer = raw[t1 + 8:].strip()
-        else:
-            result.answer = raw.strip()
+        message = response.choices[0].message
+        result.thinking = (getattr(message, "reasoning_content", None) or "").strip()
+        result.answer = (message.content or "").strip()
 
         usage = response.usage
-        result.input_tokens = usage.prompt_tokens
-        result.output_tokens = usage.completion_tokens
-
-        pricing = PRICING.get(model, PRICING["deepseek-v4-flash"])
-        result.cost_usd = (
-            result.input_tokens  / 1_000_000 * pricing["input"]
-            + result.output_tokens / 1_000_000 * pricing["output"]
+        result.input_tokens = getattr(usage, "prompt_tokens", 0) or 0
+        result.output_tokens = getattr(usage, "completion_tokens", 0) or 0
+        result.cost_usd = _estimate_cost_usd(
+            model=model,
+            prompt_tokens=result.input_tokens,
+            completion_tokens=result.output_tokens,
+            cached_prompt_tokens=_get_cached_prompt_tokens(usage),
         )
 
     except Exception as exc:
@@ -701,7 +724,6 @@ def render_mode_column(result: RunResult, mode_name: str):
 
     if result.error:
         st.error(f"**API Error:** {result.error}")
-        st.caption("Tip: If model not found, try `deepseek-chat` or `deepseek-reasoner` in settings.")
         return
 
     chips = [
@@ -741,7 +763,7 @@ def render_metrics_table(results: Dict[str, RunResult], ratings: Dict[str, int])
             "Input Tokens":    f"{res.input_tokens:,}" if ok else "—",
             "Output Tokens":   f"{res.output_tokens:,}" if ok else "—",
             "Tok/s":           f"{res.tokens_per_second:.0f}" if (ok and res.tokens_per_second) else "—",
-            "Cost (USD)":      f"${res.cost_usd:.5f}" if ok else "—",
+            "Est. Cost (USD)": f"${res.cost_usd:.5f}" if ok else "—",
             "Thinking Words":  f"{res.thinking_word_count:,}" if ok else "—",
             "User Rating":  f"{ratings.get(mode_name)}/5" if ratings.get(mode_name) else "—",
         })
@@ -937,7 +959,6 @@ def main():
         run_model_label = st.session_state.run_model_label or model_label
 
         st.divider()
-        # st.markdown('<div class="section-eyebrow">Step 3</div>', unsafe_allow_html=True)
         st.markdown('<div class="section-title">Review the comparison</div>', unsafe_allow_html=True)
         render_run_snapshot(results, run_model_label, run_task_label)
 
@@ -953,6 +974,10 @@ def main():
                 expected=run_task.get("expected_winner", "—"),
             )
             st.markdown("### Metrics Comparison")
+            st.caption(
+                "Cost values are estimates based on current published V4 pricing. "
+                "Cached prompt discounts and promotional rates may change."
+            )
             render_metrics_table(results, st.session_state.ratings)
 
         with answers_tab:
