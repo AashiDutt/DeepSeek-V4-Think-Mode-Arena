@@ -31,7 +31,7 @@ pip install -r requirements.txt
 streamlit run app.py
 ```
 
-Enter your DeepSeek API key in the sidebar (get it at platform.deepseek.com).
+Set `DEEPSEEK_API_KEY` in your environment (get a key at [platform.deepseek.com](https://platform.deepseek.com)). Do not commit keys; use `.env` locally if you like — it is listed in `.gitignore`.
 
 ## Model names
 
